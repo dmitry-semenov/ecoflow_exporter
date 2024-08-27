@@ -16,58 +16,11 @@ from prometheus_client import REGISTRY, Gauge, Counter, start_http_server
 
 load_dotenv()
 
-DIVISORS = {
-    'ecoflow_ac_set_watts': 10,
-    'ecoflow_anti_back_flow_flag': 10,
-    'ecoflow_bat_error_inv_load_limit': 10,
-    'ecoflow_bat_input_volt': 10,
-    'ecoflow_bat_input_watts': 10,
-    'ecoflow_bat_op_volt': 10,
-    'ecoflow_bat_output_load_limit': 10,
-    'ecoflow_bat_temp': 10,
-    'ecoflow_dynamic_watts': 10,
-    'ecoflow_fload_limit_out': 10,
-    'ecoflow_gene_watt': 10,
-    'ecoflow_grid_cons_watts': 10,
-    'ecoflow_inv_brightness': 10,
-    'ecoflow_inv_demand_watts': 10,
-    'ecoflow_inv_freq': 10,
-    'ecoflow_inv_input_volt': 10,
-    'ecoflow_inv_op_volt': 10,
-    'ecoflow_inv_output_load_limit': 10,
-    'ecoflow_inv_output_watts': 10,
-    'ecoflow_inv_temp': 10,
-    'ecoflow_inv_to_other_watts': 10,
-    'ecoflow_inv_to_plug_watts': 10,
-    'ecoflow_llc_input_volt': 10,
-    'ecoflow_llc_op_volt': 100,
-    'ecoflow_llc_temp': 10,
-    'ecoflow_permanent_watts': 10,
-    'ecoflow_plug_total_watts': 10,
-    'ecoflow_pv_power_limit_ac_power': 10,
-    'ecoflow_pv_to_inv_watts': 10,
-    'ecoflow_pv1_input_cur': 10,
-    'ecoflow_pv1_input_volt': 10,
-    'ecoflow_pv1_input_watts': 10,
-    'ecoflow_pv1_op_volt': 100,
-    'ecoflow_pv1_temp': 10,
-    'ecoflow_pv2_input_cur': 10,
-    'ecoflow_pv2_input_volt': 10,
-    'ecoflow_pv2_input_watts': 10,
-    'ecoflow_pv2_op_volt': 100,
-    'ecoflow_pv2_temp': 10,
-    'ecoflow_rated_power': 10,
-    'ecoflow_space_demand_watts': 10
-}
-
-
 class EcoflowApiException(Exception):
     pass
 
-
 class EcoflowMetricException(Exception):
     pass
-
 
 class EcoflowApi:
     def __init__(self, api_endpoint: str, accesskey: str, secretkey: str, device_sn: str):
@@ -113,7 +66,6 @@ class EcoflowApi:
         except json.JSONDecodeError as error:
             raise EcoflowApiException(f"Failed to parse JSON response: {response.text}, Error: {error}")
 
-
 class EcoflowMetric:
     def __init__(self, ecoflow_payload_key: str, device_name: str, documentation: str = None):
         self.ecoflow_payload_key = ecoflow_payload_key
@@ -124,20 +76,19 @@ class EcoflowMetric:
         self.last_update_time = None
 
     def _convert_key_to_prometheus_name(self) -> str:
-        key = re.sub(r'(?<!^)(?=[A-Z])', '_', self.ecoflow_payload_key.split('.')[1].replace('.', '_').replace('Statue', 'Status')).lower()
-
-        if not re.match(r"[a-zA-Z_:][a-zA-Z0-9_:]*", key):
-            raise EcoflowMetricException(f"Cannot convert payload key {self.ecoflow_payload_key} to comply with the Prometheus data model. Please, raise an issue!")
-
+        # Convert dots to underscores, remove any leading numbers and underscores
+        key = re.sub(r'^[\d_]+', '', self.ecoflow_payload_key.replace('.', '_'))
+        # Convert camelCase to snake_case
+        key = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
+        # Replace any invalid characters with underscores
+        key = re.sub(r'[^a-z0-9_]', '_', key)
+        # Ensure the key starts with a letter or underscore
+        if not key[0].isalpha() and key[0] != '_':
+            key = f"_{key}"
         return key
 
     def set(self, value):
-        original_value = value
-        if self.name in DIVISORS:
-            value /= DIVISORS[self.name]
-
-        log.debug(f"Setting {self.name} = {value} (original value: {original_value})")
-
+        log.debug(f"Setting {self.name} = {value}")
         if self.value != value:
             self.metric.labels(device=self.device_name).set(value)
             self.value = value
@@ -147,7 +98,6 @@ class EcoflowMetric:
         log.debug(f"Clearing {self.name}")
         self.metric.clear()
         self.last_update_time = time.time()
-
 
 class Worker:
     def __init__(self, ecoflow_api: Any, device_name: str, collecting_interval_seconds: int = 30, expiration_threshold: int = 300):
@@ -203,15 +153,22 @@ class Worker:
                 self.metrics_collector.append(metric)
         return metric
 
+    def flatten_dict(self, d: Dict[str, Any], parent_key: str = '', sep: str = '.') -> Dict[str, Any]:
+        items = []
+        for k, v in d.items():
+            new_key = f"{parent_key}{sep}{k}" if parent_key else k
+            if isinstance(v, dict):
+                items.extend(self.flatten_dict(v, new_key, sep=sep).items())
+            else:
+                items.append((new_key, v))
+        return dict(items)
+
     def process_payload(self, params: Dict[str, Any]):
         log.debug(f"Processing params: {params}")
-        for ecoflow_payload_key, ecoflow_payload_value in params.items():
-            if not ecoflow_payload_key.startswith('20_1.'):
-                log.debug(f"Skipping non-status entry: {ecoflow_payload_key}")
-                continue
-
+        flattened_params = self.flatten_dict(params)
+        for ecoflow_payload_key, ecoflow_payload_value in flattened_params.items():
             if not isinstance(ecoflow_payload_value, (int, float)):
-                log.info(f"Skipping unsupported metric {ecoflow_payload_key}: {ecoflow_payload_value}")
+                log.debug(f"Skipping non-numeric metric {ecoflow_payload_key}: {ecoflow_payload_value}")
                 continue
 
             metric = self.get_metric_by_ecoflow_payload_key(ecoflow_payload_key)
@@ -220,11 +177,9 @@ class Worker:
             else:
                 log.warning(f"Failed to process metric for payload key: {ecoflow_payload_key}")
 
-
 def signal_handler(signum: int, frame: Optional[object]) -> None:
     log.info(f"Received signal {signum}. Exiting...")
     sys.exit(0)
-
 
 def load_env_variable(name: str, default: Optional[str] = None) -> str:
     value = os.getenv(name, default)
@@ -232,7 +187,6 @@ def load_env_variable(name: str, default: Optional[str] = None) -> str:
         log.error(f"Environment variable {name} is required.")
         sys.exit(1)
     return value
-
 
 def main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
@@ -271,7 +225,6 @@ def main() -> None:
         log.info("Received KeyboardInterrupt. Exiting...")
         metrics.stop()
         sys.exit(0)
-
 
 if __name__ == '__main__':
     main()
