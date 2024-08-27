@@ -76,23 +76,12 @@ class EcoflowMetric:
         self.last_update_time = None
 
     def _convert_key_to_prometheus_name(self) -> str:
-        # Remove the '20_1.' prefix if present
-        key = self.ecoflow_payload_key.split('.', 1)[-1]
-        
         # Convert camelCase to snake_case
-        key = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
-        
-        # Replace any remaining dots with underscores
-        key = key.replace('.', '_')
-        
-        # Replace any invalid characters with underscores
-        key = re.sub(r'[^a-z0-9_]', '_', key)
-        
-        # Ensure the key starts with a letter or underscore
-        if not key[0].isalpha() and key[0] != '_':
-            key = f"_{key}"
-        
-        return key
+        name = re.sub(r'(?<!^)(?=[A-Z])', '_', self.ecoflow_payload_key).lower()
+        # Replace dots with underscores
+        name = name.replace('.', '_')
+        # Add 'ecoflow_' prefix
+        return f"ecoflow_{name}"
 
     def set(self, value):
         log.debug(f"Setting {self.name} = {value}")
@@ -111,7 +100,7 @@ class Worker:
         self.ecoflow_api = ecoflow_api
         self.device_name = device_name
         self.collecting_interval_seconds = collecting_interval_seconds
-        self.metrics_collector: List[EcoflowMetric] = []
+        self.metrics_collector: Dict[str, EcoflowMetric] = {}
         self.expiration_threshold = expiration_threshold
         self.running = True
         self.api_requests_total = Counter('ecoflow_api_requests_total', 'Total number of API requests', ['device'])
@@ -138,54 +127,28 @@ class Worker:
 
     def clear_expired_metrics(self):
         current_time = time.time()
-        for metric in self.metrics_collector:
+        for metric_key, metric in list(self.metrics_collector.items()):
             if metric.last_update_time and current_time - metric.last_update_time > self.expiration_threshold:
                 metric.clear()
+                del self.metrics_collector[metric_key]
                 log.info(f"Cleared expired metric {metric.name}")
 
-    def create_new_metric(self, ecoflow_payload_key: str) -> Optional[EcoflowMetric]:
-        try:
+    def get_or_create_metric(self, ecoflow_payload_key: str) -> EcoflowMetric:
+        if ecoflow_payload_key not in self.metrics_collector:
             metric = EcoflowMetric(ecoflow_payload_key, self.device_name)
-            log.info(f"Created new metric from payload key {metric.ecoflow_payload_key} -> {metric.name}")
-            return metric
-        except EcoflowMetricException as error:
-            log.error(f"Error creating metric: {error}")
-            return None
-
-    def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key: str) -> Optional[EcoflowMetric]:
-        metric = next((metric for metric in self.metrics_collector if metric.ecoflow_payload_key == ecoflow_payload_key), None)
-        if metric:
-            log.debug(f"Found metric {metric.name} linked to {ecoflow_payload_key}")
-        else:
-            log.debug(f"Cannot find metric linked to {ecoflow_payload_key}. Creating new metric")
-            metric = self.create_new_metric(ecoflow_payload_key)
-            if metric:
-                self.metrics_collector.append(metric)
-        return metric
-
-    def flatten_dict(self, d: Dict[str, Any], parent_key: str = '', sep: str = '.') -> Dict[str, Any]:
-        items = []
-        for k, v in d.items():
-            new_key = f"{parent_key}{sep}{k}" if parent_key else k
-            if isinstance(v, dict):
-                items.extend(self.flatten_dict(v, new_key, sep=sep).items())
-            else:
-                items.append((new_key, v))
-        return dict(items)
+            self.metrics_collector[ecoflow_payload_key] = metric
+            log.info(f"Created new metric: {metric.name}")
+        return self.metrics_collector[ecoflow_payload_key]
 
     def process_payload(self, params: Dict[str, Any]):
         log.debug(f"Processing params: {params}")
-        flattened_params = self.flatten_dict(params)
-        for ecoflow_payload_key, ecoflow_payload_value in flattened_params.items():
+        for ecoflow_payload_key, ecoflow_payload_value in params.items():
             if not isinstance(ecoflow_payload_value, (int, float)):
                 log.debug(f"Skipping non-numeric metric {ecoflow_payload_key}: {ecoflow_payload_value}")
                 continue
 
-            metric = self.get_metric_by_ecoflow_payload_key(ecoflow_payload_key)
-            if metric:
-                metric.set(ecoflow_payload_value)
-            else:
-                log.warning(f"Failed to process metric for payload key: {ecoflow_payload_key}")
+            metric = self.get_or_create_metric(ecoflow_payload_key)
+            metric.set(ecoflow_payload_value)
 
 def signal_handler(signum: int, frame: Optional[object]) -> None:
     log.info(f"Received signal {signum}. Exiting...")
