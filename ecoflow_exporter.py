@@ -76,36 +76,14 @@ class EcoflowMetric:
         self.last_update_time = None
 
     def _convert_key_to_prometheus_name(self) -> str:
-        # Special cases
-        special_cases = {
-            "pd.wattsOutSum": "pd_watts_out_sum",
-            "inv.acInVol": "inv_ac_in_vol",
-            "inv.acInAmp": "inv_ac_in_amp",
-            "inv.invOutVol": "inv_inv_out_vol",
-            "inv.invOutAmp": "inv_inv_out_amp",
-            "inv.acOutFreq": "inv_cfg_ac_out_freq",
-            "bms.bmsStatus.vol": "bms_master_vol",
-            "bms.bmsStatus.amp": "bms_master_amp",
-            "bms.bmsStatus.soc": "bms_master_soc",
-            "bms.bmsStatus.remainCap": "bms_master_remain_cap",
-            "bms.bmsStatus.fullCap": "bms_master_full_cap",
-            "bms.bmsStatus.cycles": "bms_master_cycles",
-            "bms.bmsStatus.minCellTemp": "bms_master_min_cell_temp",
-            "bms.bmsStatus.maxCellTemp": "bms_master_max_cell_temp",
-            "bms.bmsStatus.minCellVol": "bms_master_min_cell_vol",
-            "bms.bmsStatus.maxCellVol": "bms_master_max_cell_vol",
-            "ems.chgRemainTime": "ems_chg_remain_time",
-            "ems.dsgRemainTime": "ems_dsg_remain_time",
-        }
-
-        if self.ecoflow_payload_key in special_cases:
-            return special_cases[self.ecoflow_payload_key]
-
-        # Remove the '20_1.' prefix and convert to lowercase
-        key = self.ecoflow_payload_key.split('.', 1)[-1].lower()
+        # Remove the '20_1.' prefix if present
+        key = self.ecoflow_payload_key.split('.', 1)[-1]
         
         # Convert camelCase to snake_case
-        key = re.sub(r'(?<!^)(?=[A-Z])', '_', key)
+        key = re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
+        
+        # Replace any remaining dots with underscores
+        key = key.replace('.', '_')
         
         # Replace any invalid characters with underscores
         key = re.sub(r'[^a-z0-9_]', '_', key)
@@ -139,7 +117,6 @@ class Worker:
         self.api_requests_total = Counter('ecoflow_api_requests_total', 'Total number of API requests', ['device'])
         self.api_errors_total = Counter('ecoflow_api_errors_total', 'Total number of API errors', ['device'])
         self.online_metric = Gauge('ecoflow_online', 'Device online status', ['device'])
-        self.mqtt_messages_total = Counter('ecoflow_mqtt_messages_receive_total', 'Total number of MQTT messages received', ['device'])
 
     def loop(self):
         while self.running:
@@ -149,7 +126,6 @@ class Worker:
                 log.debug(f"Received payload: {payload}")
                 self.process_payload(payload)
                 self.online_metric.labels(device=self.device_name).set(1)
-                self.mqtt_messages_total.labels(device=self.device_name).inc()
             except Exception as error:
                 self.api_errors_total.labels(device=self.device_name).inc()
                 self.online_metric.labels(device=self.device_name).set(0)
