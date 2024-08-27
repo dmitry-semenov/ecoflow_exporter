@@ -52,12 +52,12 @@ All metrics are prefixed with `ecoflow` and reports label `device` for multiple 
 
 ⚠️ This has only been tested with the following EcoFlow products:
 
-- __River Max__
-- __River 2__
-- __River 2 Max__
-- __DELTA 2__
-- __DELTA Pro__
-- __DELTA Max__
+- **River Max**
+- **River 2**
+- **River 2 Max**
+- **DELTA 2**
+- **DELTA Pro**
+- **DELTA Max**
 
 Please, create an issue to let me know if exporter works well (or not) with your model.
 
@@ -71,9 +71,9 @@ Required:
 
 `DEVICE_SN` - the device serial number
 
-`ECOFLOW_USERNAME` - EcoFlow account username
+`ECOFLOW_ACCESSKEY`
 
-`ECOFLOW_PASSWORD` - EcoFlow account password
+`ECOFLOW_SECRETKEY`
 
 Optional:
 
@@ -86,7 +86,7 @@ Optional:
 - Example of running docker image:
 
 ```bash
-docker run -e DEVICE_SN=<your device SN> -e ECOFLOW_USERNAME=<your username> -e ECOFLOW_PASSWORD=<your password> -it -p 9090:9090 --network=host ghcr.io/berezhinskiy/ecoflow_exporter
+docker run -e DEVICE_SN=<your device SN> -e ECOFLOW_ACCESSKEY=<your access_key> -e ECOFLOW_SECRETKEY=<your secret> -it -p 9090:9090 --network=host ghcr.io/berezhinskiy/ecoflow_exporter
 ```
 
 will run the image with the exporter on `*:9090`
