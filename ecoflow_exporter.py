@@ -9,104 +9,100 @@ import re
 import base64
 import hashlib
 import hmac
-from queue import Queue
-from threading import Timer
-from multiprocessing import Process
+from queue import Queue, Empty
+from threading import Event
 import paho.mqtt.client as mqtt
 from prometheus_client import start_http_server, REGISTRY, Gauge, Counter
-
-class RepeatTimer(Timer):
-    def run(self):
-        while not self.finished.wait(self.interval):
-            self.function(*self.args, **self.kwargs)
+import requests
 
 class EcoflowMetricException(Exception):
     pass
 
-class EcoflowMQTT():
-    def __init__(self, message_queue, device_sn, access_key, secret_key, addr, port, timeout_seconds):
-        self.message_queue = message_queue
-        self.addr = addr
-        self.port = port
-        self.device_sn = device_sn
+class EcoflowAuthentication:
+    def __init__(self, access_key, secret_key, api_host):
         self.access_key = access_key
         self.secret_key = secret_key
-        self.topic = f"/open/{access_key}/{device_sn}/quota"
-        self.timeout_seconds = timeout_seconds
-        self.last_message_time = None
+        self.api_host = api_host
+        self.mqtt_url = None
+        self.mqtt_port = None
+        self.mqtt_username = None
+        self.mqtt_password = None
+
+    def get_mqtt_credentials(self):
+        url = f"https://{self.api_host}/iot-open/sign/certification"
+        timestamp = str(int(time.time() * 1000))
+        nonce = base64.b64encode(hashlib.sha256(timestamp.encode()).digest()).decode()[:-1]
+        to_sign = f'accessKey={self.access_key}&nonce={nonce}&timestamp={timestamp}'
+        sign = hmac.new(self.secret_key.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+
+        headers = {
+            'accessKey': self.access_key,
+            'timestamp': timestamp,
+            'nonce': nonce,
+            'sign': sign
+        }
+
+        response = requests.get(url, headers=headers)
+        if response.status_code == 200:
+            data = response.json()['data']
+            self.mqtt_url = data['url']
+            self.mqtt_port = int(data['port'])
+            self.mqtt_username = data['certificateAccount']
+            self.mqtt_password = data['certificatePassword']
+        else:
+            raise Exception(f"Failed to get MQTT credentials: {response.text}")
+
+class EcoflowMQTT:
+    def __init__(self, message_queue, auth: EcoflowAuthentication, device_sn):
+        self.message_queue = message_queue
+        self.auth = auth
+        self.device_sn = device_sn
+        self.connected = False
         self.client = None
+        self.stop_event = Event()
 
+        self.auth.get_mqtt_credentials()
         self.connect()
-
-        self.idle_timer = RepeatTimer(10, self.idle_reconnect)
-        self.idle_timer.daemon = True
-        self.idle_timer.start()
 
     def connect(self):
         if self.client:
             self.client.loop_stop()
             self.client.disconnect()
 
-        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        self.client = mqtt.Client(client_id="", clean_session=True, protocol=mqtt.MQTTv311, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self.client.username_pw_set(self.auth.mqtt_username, self.auth.mqtt_password)
         self.client.tls_set(certfile=None, keyfile=None, cert_reqs=ssl.CERT_REQUIRED)
         self.client.tls_insecure_set(False)
         self.client.on_connect = self.on_connect
         self.client.on_disconnect = self.on_disconnect
         self.client.on_message = self.on_message
 
-        # Generate authentication parameters
-        timestamp = str(int(time.time() * 1000))
-        nonce = base64.b64encode(hashlib.sha256(timestamp.encode()).digest()).decode()[:-1]
-        to_sign = f'accessKey={self.access_key}&nonce={nonce}&timestamp={timestamp}'
-        sign = hmac.new(self.secret_key.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
-
-        # Set authentication headers
-        self.client.username_pw_set(username=self.access_key, password=self.secret_key)
-        self.client._username = self.access_key
-        self.client._password = self.secret_key
-        self.client._connect_properties = mqtt.Properties(
-            UserProperty=[
-                ("accessKey", self.access_key),
-                ("timestamp", timestamp),
-                ("nonce", nonce),
-                ("sign", sign)
-            ]
-        )
-
-        log.info(f"Connecting to MQTT Broker {self.addr}:{self.port}")
-        self.client.connect(self.addr, self.port)
+        log.info(f"Connecting to MQTT Broker {self.auth.mqtt_url}:{self.auth.mqtt_port}")
+        self.client.connect(self.auth.mqtt_url, self.auth.mqtt_port)
         self.client.loop_start()
 
-    def idle_reconnect(self):
-        if self.last_message_time and time.time() - self.last_message_time > self.timeout_seconds:
-            log.error(f"No messages received for {self.timeout_seconds} seconds. Reconnecting to MQTT")
-            while True:
-                connect_process = Process(target=self.connect)
-                connect_process.start()
-                connect_process.join(timeout=60)
-                connect_process.terminate()
-                if connect_process.exitcode == 0:
-                    log.info("Reconnection successful, continuing")
-                    self.last_message_time = None
-                    break
-                else:
-                    log.error("Reconnection errored out, or timed out, attempted to reconnect...")
-
-    def on_connect(self, client, userdata, flags, reason_code, properties):
-        self.last_message_time = time.time()
-        if reason_code == 0:
-            self.client.subscribe(self.topic)
-            log.info(f"Subscribed to MQTT topic {self.topic}")
+    def on_connect(self, client, userdata, flags, rc, properties=None):
+        if rc == 0:
+            self.connected = True
+            log.info("Connected to Ecoflow MQTT Server")
+            topic = f"/open/{self.auth.mqtt_username}/{self.device_sn}/quota"
+            self.client.subscribe(topic)
+            log.info(f"Subscribed to MQTT topic {topic}")
         else:
-            log.error(f"Failed to connect to MQTT: {mqtt.connack_string(reason_code)}")
+            log.error(f"Failed to connect to MQTT: {mqtt.connack_string(rc)}")
 
-    def on_disconnect(self, client, userdata, rc):
+    def on_disconnect(self, client, userdata, rc, properties=None):
         if rc != 0:
-            log.error(f"Unexpected MQTT disconnection. Will auto-reconnect")
+            log.error(f"Unexpected MQTT disconnection: {rc}. Will auto-reconnect")
 
     def on_message(self, client, userdata, message):
         self.message_queue.put(message.payload.decode("utf-8"))
-        self.last_message_time = time.time()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.client:
+            self.client.loop_stop()
+            self.client.disconnect()
 
 class EcoflowMetric:
     def __init__(self, ecoflow_payload_key, device_name):
@@ -135,45 +131,37 @@ class EcoflowMetric:
         self.metric.clear()
 
 class Worker:
-    def __init__(self, message_queue, device_name, collecting_interval_seconds=10):
+    def __init__(self, message_queue, device_name):
         self.message_queue = message_queue
         self.device_name = device_name
-        self.collecting_interval_seconds = collecting_interval_seconds
         self.metrics_collector = []
         self.online = Gauge("ecoflow_online", "1 if device is online", labelnames=["device"])
         self.mqtt_messages_receive_total = Counter("ecoflow_mqtt_messages_receive_total", "total MQTT messages", labelnames=["device"])
+        self.stop_event = Event()
 
     def loop(self):
-        time.sleep(self.collecting_interval_seconds)
-        while True:
-            queue_size = self.message_queue.qsize()
-            if queue_size > 0:
-                log.info(f"Processing {queue_size} event(s) from the message queue")
-                self.online.labels(device=self.device_name).set(1)
-                self.mqtt_messages_receive_total.labels(device=self.device_name).inc(queue_size)
-            else:
-                log.info("Message queue is empty. Assuming that the device is offline")
-                self.online.labels(device=self.device_name).set(0)
-                for metric in self.metrics_collector:
-                    metric.clear()
-
-            while not self.message_queue.empty():
-                payload = self.message_queue.get()
+        self.online.labels(device=self.device_name).set(1)
+        while not self.stop_event.is_set():
+            try:
+                payload = self.message_queue.get(timeout=1)
+                self.mqtt_messages_receive_total.labels(device=self.device_name).inc()
                 log.debug(f"Received payload: {payload}")
-                if payload is None:
-                    continue
 
                 try:
-                    payload = json.loads(payload)
-                    params = payload['params']
+                    payload_json = json.loads(payload)
+                    params = payload_json['params']
+                    self.process_payload(params)
                 except KeyError as key:
                     log.error(f"Failed to extract key {key} from payload: {payload}")
+                except json.JSONDecodeError:
+                    log.error(f"Failed to parse MQTT payload: {payload}")
                 except Exception as error:
-                    log.error(f"Failed to parse MQTT payload: {payload} Error: {error}")
-                    continue
-                self.process_payload(params)
+                    log.error(f"Error processing payload: {error}")
+            except Empty:
+                # This is expected, it allows us to check the stop_event regularly
+                pass
 
-            time.sleep(self.collecting_interval_seconds)
+        self.online.labels(device=self.device_name).set(0)
 
     def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key):
         for metric in self.metrics_collector:
@@ -185,8 +173,7 @@ class Worker:
 
     def process_payload(self, params):
         log.debug(f"Processing params: {params}")
-        for ecoflow_payload_key in params.keys():
-            ecoflow_payload_value = params[ecoflow_payload_key]
+        for ecoflow_payload_key, ecoflow_payload_value in params.items():
             if not isinstance(ecoflow_payload_value, (int, float)):
                 try:
                     ecoflow_payload_value = float(ecoflow_payload_value)
@@ -206,11 +193,8 @@ class Worker:
 
             metric.set(ecoflow_payload_value)
 
-            if ecoflow_payload_key == 'inv.acInVol' and ecoflow_payload_value == 0:
-                ac_in_current = self.get_metric_by_ecoflow_payload_key('inv.acInAmp')
-                if ac_in_current:
-                    log.debug("Set AC inverter input current to zero because of zero inverter voltage")
-                    ac_in_current.set(0)
+    def stop(self):
+        self.stop_event.set()
 
 def signal_handler(signum, frame):
     log.info(f"Received signal {signum}. Exiting...")
@@ -223,48 +207,37 @@ def main():
         REGISTRY.unregister(coll)
 
     log_level = os.getenv("LOG_LEVEL", "INFO")
-
-    match log_level:
-        case "DEBUG":
-            log_level = log.DEBUG
-        case "INFO":
-            log_level = log.INFO
-        case "WARNING":
-            log_level = log.WARNING
-        case "ERROR":
-            log_level = log.ERROR
-        case _:
-            log_level = log.INFO
-
+    log_level = getattr(log, log_level, log.INFO)
     log.basicConfig(stream=sys.stdout, level=log_level, format='%(asctime)s %(levelname)-7s %(message)s')
 
     device_sn = os.getenv("DEVICE_SN")
     device_name = os.getenv("DEVICE_NAME") or device_sn
     access_key = os.getenv("ECOFLOW_ACCESS_KEY")
     secret_key = os.getenv("ECOFLOW_SECRET_KEY")
-    mqtt_host = os.getenv("MQTT_HOST", "mqtt.ecoflow.com")
-    mqtt_port = int(os.getenv("MQTT_PORT", "8883"))
+    api_host = os.getenv("ECOFLOW_API_HOST", "api-e.ecoflow.com")
     exporter_port = int(os.getenv("EXPORTER_PORT", "9090"))
-    collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "10"))
-    timeout_seconds = int(os.getenv("MQTT_TIMEOUT", "60"))
 
     if not all([device_sn, access_key, secret_key]):
         log.error("Please provide all required environment variables: DEVICE_SN, ECOFLOW_ACCESS_KEY, ECOFLOW_SECRET_KEY")
         sys.exit(1)
 
+    auth = EcoflowAuthentication(access_key, secret_key, api_host)
     message_queue = Queue()
 
-    EcoflowMQTT(message_queue, device_sn, access_key, secret_key, mqtt_host, mqtt_port, timeout_seconds)
-
-    metrics = Worker(message_queue, device_name, collecting_interval_seconds)
+    mqtt_client = EcoflowMQTT(message_queue, auth, device_sn)
+    worker = Worker(message_queue, device_name)
 
     start_http_server(exporter_port)
+    log.info(f"HTTP server started on port {exporter_port}")
 
     try:
-        metrics.loop()
+        worker.loop()
     except KeyboardInterrupt:
         log.info("Received KeyboardInterrupt. Exiting...")
-        sys.exit(0)
+    finally:
+        mqtt_client.stop()
+        worker.stop()
+        log.info("Exporter stopped")
 
 if __name__ == '__main__':
     main()
