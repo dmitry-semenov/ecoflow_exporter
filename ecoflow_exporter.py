@@ -1,363 +1,267 @@
-import logging as log
-import sys
-import os
-import signal
-import ssl
-import time
-import json
-import re
 import base64
-import uuid
-from queue import Queue
-from threading import Timer
-from multiprocessing import Process
+import hashlib
+import hmac
+import json
+import logging as log
+import os
+import re
+import signal
+import sys
+import time
+from typing import Any, Dict, List, Optional, Tuple
+
 import requests
-import paho.mqtt.client as mqtt
-from prometheus_client import start_http_server, REGISTRY, Gauge, Counter
+from dotenv import load_dotenv
+from prometheus_client import REGISTRY, Gauge, start_http_server
+
+load_dotenv()
+
+DIVISORS = {
+    'ecoflow_ac_set_watts': 10,
+    'ecoflow_anti_back_flow_flag': 10,
+    'ecoflow_bat_error_inv_load_limit': 10,
+    'ecoflow_bat_input_volt': 10,
+    'ecoflow_bat_input_watts': 10,
+    'ecoflow_bat_op_volt': 10,
+    'ecoflow_bat_output_load_limit': 10,
+    'ecoflow_bat_temp': 10,
+    'ecoflow_dynamic_watts': 10,
+    'ecoflow_fload_limit_out': 10,
+    'ecoflow_gene_watt': 10,
+    'ecoflow_grid_cons_watts': 10,
+    'ecoflow_inv_brightness': 10,
+    'ecoflow_inv_demand_watts': 10,
+    'ecoflow_inv_freq': 10,
+    'ecoflow_inv_input_volt': 10,
+    'ecoflow_inv_op_volt': 10,
+    'ecoflow_inv_output_load_limit': 10,
+    'ecoflow_inv_output_watts': 10,
+    'ecoflow_inv_temp': 10,
+    'ecoflow_inv_to_other_watts': 10,
+    'ecoflow_inv_to_plug_watts': 10,
+    'ecoflow_llc_input_volt': 10,
+    'ecoflow_llc_op_volt': 100,
+    'ecoflow_llc_temp': 10,
+    'ecoflow_permanent_watts': 10,
+    'ecoflow_plug_total_watts': 10,
+    'ecoflow_pv_power_limit_ac_power': 10,
+    'ecoflow_pv_to_inv_watts': 10,
+    'ecoflow_pv1_input_cur': 10,
+    'ecoflow_pv1_input_volt': 10,
+    'ecoflow_pv1_input_watts': 10,
+    'ecoflow_pv1_op_volt': 100,
+    'ecoflow_pv1_temp': 10,
+    'ecoflow_pv2_input_cur': 10,
+    'ecoflow_pv2_input_volt': 10,
+    'ecoflow_pv2_input_watts': 10,
+    'ecoflow_pv2_op_volt': 100,
+    'ecoflow_pv2_temp': 10,
+    'ecoflow_rated_power': 10,
+    'ecoflow_space_demand_watts': 10
+}
 
 
-class RepeatTimer(Timer):
-    def run(self):
-        while not self.finished.wait(self.interval):
-            self.function(*self.args, **self.kwargs)
+class EcoflowApiException(Exception):
+    pass
 
 
 class EcoflowMetricException(Exception):
     pass
 
 
-class EcoflowAuthentication:
-    def __init__(self, ecoflow_username, ecoflow_password):
-        self.ecoflow_username = ecoflow_username
-        self.ecoflow_password = ecoflow_password
-        self.mqtt_url = "mqtt.ecoflow.com"
-        self.mqtt_port = 8883
-        self.mqtt_username = None
-        self.mqtt_password = None
-        self.mqtt_client_id = None
-        self.authorize()
+class EcoflowApi:
+    def __init__(self, api_endpoint: str, accesskey: str, secretkey: str, device_sn: str):
+        self.api_endpoint = api_endpoint
+        self.accesskey = accesskey
+        self.secretkey = secretkey
+        self.device_sn = device_sn
 
-    def authorize(self):
-        url = "https://api.ecoflow.com/auth/login"
-        headers = {"lang": "en_US", "content-type": "application/json"}
-        data = {"email": self.ecoflow_username,
-                "password": base64.b64encode(self.ecoflow_password.encode()).decode(),
-                "scene": "IOT_APP",
-                "userType": "ECOFLOW"}
+    def get_quota(self) -> Dict[str, Any]:
+        timestamp, nonce, sign = self._generate_auth_params()
+        url = f"https://{self.api_endpoint}/iot-open/sign/device/quota/all?sn={self.device_sn}"
+        headers = {
+            'Content-Type': 'application/json;charset=UTF-8',
+            'accessKey': self.accesskey,
+            'nonce': nonce,
+            'timestamp': timestamp,
+            'sign': sign,
+        }
 
-        log.info(f"Login to EcoFlow API {url}")
-        request = requests.post(url, json=data, headers=headers)
-        response = self.get_json_response(request)
+        log.info(f"Getting payload from {url}")
 
-        try:
-            token = response["data"]["token"]
-            user_id = response["data"]["user"]["userId"]
-            user_name = response["data"]["user"]["name"]
-        except KeyError as key:
-            raise Exception(f"Failed to extract key {key} from response: {response}")
+        response = requests.get(url, headers=headers)
+        return self._get_json_response(response)
 
-        log.info(f"Successfully logged in: {user_name}")
+    def _generate_auth_params(self) -> Tuple[str, str, str]:
+        timestamp = str(int(time.time() * 1000))
+        nonce = base64.b64encode(hashlib.sha256(timestamp.encode()).digest()).decode()[:-1]
+        to_sign = f'accessKey={self.accesskey}&nonce={nonce}&timestamp={timestamp}'
+        sign = hmac.new(self.secretkey.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+        return timestamp, nonce, sign
 
-        url = "https://api.ecoflow.com/iot-auth/app/certification"
-        headers = {"lang": "en_US", "authorization": f"Bearer {token}"}
-        data = {"userId": user_id}
-
-        log.info(f"Requesting IoT MQTT credentials {url}")
-        request = requests.get(url, data=data, headers=headers)
-        response = self.get_json_response(request)
+    def _get_json_response(self, response: requests.Response) -> Dict[str, Any]:
+        if response.status_code != 200:
+            raise EcoflowApiException(f"HTTP status code {response.status_code}: {response.text}")
 
         try:
-            self.mqtt_url = response["data"]["url"]
-            self.mqtt_port = int(response["data"]["port"])
-            self.mqtt_username = response["data"]["certificateAccount"]
-            self.mqtt_password = response["data"]["certificatePassword"]
-            self.mqtt_client_id = f"ANDROID_{str(uuid.uuid4()).upper()}_{user_id}"
+            response_data = response.json()
+            if response_data.get("message", "").lower() != "success":
+                raise EcoflowApiException(f"API response error: {response_data.get('message', 'Unknown error')}")
+            return response_data["data"]
         except KeyError as key:
-            raise Exception(f"Failed to extract key {key} from {response}")
-
-        log.info(f"Successfully extracted account: {self.mqtt_username}")
-
-    def get_json_response(self, request):
-        if request.status_code != 200:
-            raise Exception(f"Got HTTP status code {request.status_code}: {request.text}")
-
-        try:
-            response = json.loads(request.text)
-            response_message = response["message"]
-        except KeyError as key:
-            raise Exception(f"Failed to extract key {key} from {response}")
-        except Exception as error:
-            raise Exception(f"Failed to parse response: {request.text} Error: {error}")
-
-        if response_message.lower() != "success":
-            raise Exception(f"{response_message}")
-
-        return response
-
-
-class EcoflowMQTT():
-
-    def __init__(self, message_queue, device_sn, username, password, addr, port, client_id, timeout_seconds):
-        self.message_queue = message_queue
-        self.addr = addr
-        self.port = port
-        self.username = username
-        self.password = password
-        self.client_id = client_id
-        self.topic = f"/app/device/property/{device_sn}"
-        self.timeout_seconds = timeout_seconds
-        self.last_message_time = None
-        self.client = None
-
-        self.connect()
-
-        self.idle_timer = RepeatTimer(10, self.idle_reconnect)
-        self.idle_timer.daemon = True
-        self.idle_timer.start()
-
-    def connect(self):
-        if self.client:
-            self.client.loop_stop()
-            self.client.disconnect()
-
-        self.client = mqtt.Client(self.client_id)
-        self.client.username_pw_set(self.username, self.password)
-        self.client.tls_set(certfile=None, keyfile=None, cert_reqs=ssl.CERT_REQUIRED)
-        self.client.tls_insecure_set(False)
-        self.client.on_connect = self.on_connect
-        self.client.on_disconnect = self.on_disconnect
-        self.client.on_message = self.on_message
-
-        log.info(f"Connecting to MQTT Broker {self.addr}:{self.port} using client id {self.client_id}")
-        self.client.connect(self.addr, self.port)
-        self.client.loop_start()
-
-    def idle_reconnect(self):
-        if self.last_message_time and time.time() - self.last_message_time > self.timeout_seconds:
-            log.error(f"No messages received for {self.timeout_seconds} seconds. Reconnecting to MQTT")
-            # We pull the following into a separate process because there are actually quite a few things that can go
-            # wrong inside the connection code, including it just timing out and never returning. So this gives us a
-            # measure of safety around reconnection
-            while True:
-                connect_process = Process(target=self.connect)
-                connect_process.start()
-                connect_process.join(timeout=60)
-                connect_process.terminate()
-                if connect_process.exitcode == 0:
-                    log.info("Reconnection successful, continuing")
-                    # Reset last_message_time here to avoid a race condition between idle_reconnect getting called again
-                    # before on_connect() or on_message() are called
-                    self.last_message_time = None
-                    break
-                else:
-                    log.error("Reconnection errored out, or timed out, attempted to reconnect...")
-
-    def on_connect(self, client, userdata, flags, rc):
-        # Initialize the time of last message at least once upon connection so that other things that rely on that to be
-        # set (like idle_reconnect) work
-        self.last_message_time = time.time()
-        match rc:
-            case 0:
-                self.client.subscribe(self.topic)
-                log.info(f"Subscribed to MQTT topic {self.topic}")
-            case -1:
-                log.error("Failed to connect to MQTT: connection timed out")
-            case 1:
-                log.error("Failed to connect to MQTT: incorrect protocol version")
-            case 2:
-                log.error("Failed to connect to MQTT: invalid client identifier")
-            case 3:
-                log.error("Failed to connect to MQTT: server unavailable")
-            case 4:
-                log.error("Failed to connect to MQTT: bad username or password")
-            case 5:
-                log.error("Failed to connect to MQTT: not authorised")
-            case _:
-                log.error(f"Failed to connect to MQTT: another error occured: {rc}")
-
-        return client
-
-    def on_disconnect(self, client, userdata, rc):
-        if rc != 0:
-            log.error(f"Unexpected MQTT disconnection: {rc}. Will auto-reconnect")
-            time.sleep(5)
-
-    def on_message(self, client, userdata, message):
-        self.message_queue.put(message.payload.decode("utf-8"))
-        self.last_message_time = time.time()
+            raise EcoflowApiException(f"Missing key {key} in response: {response.text}")
+        except json.JSONDecodeError as error:
+            raise EcoflowApiException(f"Failed to parse JSON response: {response.text}, Error: {error}")
 
 
 class EcoflowMetric:
-    def __init__(self, ecoflow_payload_key, device_name):
+    def __init__(self, ecoflow_payload_key: str, device_name: str, documentation: str = None):
         self.ecoflow_payload_key = ecoflow_payload_key
         self.device_name = device_name
-        self.name = f"ecoflow_{self.convert_ecoflow_key_to_prometheus_name()}"
-        self.metric = Gauge(self.name, f"value from MQTT object key {ecoflow_payload_key}", labelnames=["device"])
+        self.name = f"ecoflow_{self._convert_key_to_prometheus_name()}"
+        self.metric = Gauge(self.name, documentation or f"value from API object key {ecoflow_payload_key}", labelnames=["device"])
+        self.value = None
+        self.last_update_time = None
 
-    def convert_ecoflow_key_to_prometheus_name(self):
-        # bms_bmsStatus.maxCellTemp -> bms_bms_status_max_cell_temp
-        # pd.ext4p8Port -> pd_ext4p8_port
-        key = self.ecoflow_payload_key.replace('.', '_')
-        new = key[0].lower()
-        for character in key[1:]:
-            if character.isupper() and not new[-1] == '_':
-                new += '_'
-            new += character.lower()
-        # Check that metric name complies with the data model for valid characters
-        # https://prometheus.io/docs/concepts/data_model/#metric-names-and-labels
-        if not re.match("[a-zA-Z_:][a-zA-Z0-9_:]*", new):
+    def _convert_key_to_prometheus_name(self) -> str:
+        # Convert the payload key to Prometheus format by converting camel case to snake case
+        key = re.sub(r'(?<!^)(?=[A-Z])', '_', self.ecoflow_payload_key.split('.')[1].replace('.', '_').replace('Statue', 'Status')).lower()
+
+        # Check if the converted key complies with the Prometheus data model
+        if not re.match(r"[a-zA-Z_:][a-zA-Z0-9_:]*", key):
             raise EcoflowMetricException(f"Cannot convert payload key {self.ecoflow_payload_key} to comply with the Prometheus data model. Please, raise an issue!")
-        return new
+
+        return key
 
     def set(self, value):
-        # According to best practices for naming metrics and labels, the voltage should be in volts and the current in amperes
-        # WARNING! This will ruin all Prometheus historical data and backward compatibility of Grafana dashboard
-        # value = value / 1000 if value.endswith("_vol") or value.endswith("_amp") else value
+        if self.name in DIVISORS:
+            value /= DIVISORS[self.name]
+
         log.debug(f"Set {self.name} = {value}")
-        self.metric.labels(device=self.device_name).set(value)
+
+        if self.value != value:
+            self.metric.labels(device=self.device_name).set(value)
+            self.value = value
+            self.last_update_time = time.time()
 
     def clear(self):
         log.debug(f"Clear {self.name}")
         self.metric.clear()
+        self.last_update_time = time.time()
 
 
 class Worker:
-    def __init__(self, message_queue, device_name, collecting_interval_seconds=10):
-        self.message_queue = message_queue
+    def __init__(self, ecoflow_api: Any, device_name: str, collecting_interval_seconds: int = 30, expiration_threshold: int = 300):
+        self.ecoflow_api = ecoflow_api
         self.device_name = device_name
         self.collecting_interval_seconds = collecting_interval_seconds
-        self.metrics_collector = []
-        self.online = Gauge("ecoflow_online", "1 if device is online", labelnames=["device"])
-        self.mqtt_messages_receive_total = Counter("ecoflow_mqtt_messages_receive_total", "total MQTT messages", labelnames=["device"])
+        self.metrics_collector: List[EcoflowMetric] = []
+        self.expiration_threshold = expiration_threshold
+        self.running = True
 
     def loop(self):
-        time.sleep(self.collecting_interval_seconds)
-        while True:
-            queue_size = self.message_queue.qsize()
-            if queue_size > 0:
-                log.info(f"Processing {queue_size} event(s) from the message queue")
-                self.online.labels(device=self.device_name).set(1)
-                self.mqtt_messages_receive_total.labels(device=self.device_name).inc(queue_size)
-            else:
-                log.info("Message queue is empty. Assuming that the device is offline")
-                self.online.labels(device=self.device_name).set(0)
-                # Clear metrics for NaN (No data) instead of last value
-                for metric in self.metrics_collector:
-                    metric.clear()
-
-            while not self.message_queue.empty():
-                payload = self.message_queue.get()
-                log.debug(f"Recived payload: {payload}")
-                if payload is None:
-                    continue
-
-                try:
-                    payload = json.loads(payload)
-                    params = payload['params']
-                except KeyError as key:
-                    log.error(f"Failed to extract key {key} from payload: {payload}")
-                except Exception as error:
-                    log.error(f"Failed to parse MQTT payload: {payload} Error: {error}")
-                    continue
-                self.process_payload(params)
-
+        while self.running:
+            try:
+                self.process_payload(self.ecoflow_api.get_quota())
+            except Exception as error:
+                log.error(f"Error processing payload: {error}")
+            self.clear_expired_metrics()
             time.sleep(self.collecting_interval_seconds)
 
-    def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key):
-        for metric in self.metrics_collector:
-            if metric.ecoflow_payload_key == ecoflow_payload_key:
-                log.debug(f"Found metric {metric.name} linked to {ecoflow_payload_key}")
-                return metric
-        log.debug(f"Cannot find metric linked to {ecoflow_payload_key}")
-        return False
+    def stop(self):
+        self.running = False
 
-    def process_payload(self, params):
+    def clear_expired_metrics(self):
+        # Clear metrics that haven't been updated for more than the expiration threshold in seconds
+        current_time = time.time()
+        for metric in self.metrics_collector:
+            if current_time - metric.last_update_time > self.expiration_threshold:
+                metric.clear()
+                log.info(f"Cleared expired metric {metric.name}")
+
+    def create_new_metric(self, ecoflow_payload_key: str) -> EcoflowMetric:
+        try:
+            metric = EcoflowMetric(ecoflow_payload_key, self.device_name)
+            log.info(f"Created new metric from payload key {metric.ecoflow_payload_key} -> {metric.name}")
+            return metric
+        except EcoflowMetricException as error:
+            log.error(error)
+            return None
+
+    def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key: str) -> EcoflowMetric:
+        # Find the metric linked to the provided ecoflow payload key, or create a new one if not found
+        metric = next((metric for metric in self.metrics_collector if metric.ecoflow_payload_key == ecoflow_payload_key), None)
+        if metric:
+            log.debug(f"Found metric {metric.name} linked to {ecoflow_payload_key}")
+        else:
+            log.debug(f"Cannot find metric linked to {ecoflow_payload_key}. Creating new metric")
+            metric = self.create_new_metric(ecoflow_payload_key)
+            self.metrics_collector.append(metric)
+        return metric
+
+    def process_payload(self, params: Dict[str, Any]):
         log.debug(f"Processing params: {params}")
         for ecoflow_payload_key in params.keys():
-            ecoflow_payload_value = params[ecoflow_payload_key]
-            if isinstance(ecoflow_payload_value, list):
-                log.warning(f"Skipping unsupported metric {ecoflow_payload_key}: {ecoflow_payload_value}")
+            # Skip non-status entries (e.g., '20_134.' for statistics)
+            if not ecoflow_payload_key.startswith('20_1.'):
                 continue
 
+            # Skip unsupported metric types (e.g., non-numeric values)
+            ecoflow_payload_value = params[ecoflow_payload_key]
+            if not isinstance(ecoflow_payload_value, (int, float)):
+                log.info(f"Skipping unsupported metric {ecoflow_payload_key}: {ecoflow_payload_value}")
+                continue
+
+            # Create or get the metric for the current payload key
             metric = self.get_metric_by_ecoflow_payload_key(ecoflow_payload_key)
-            if not metric:
-                try:
-                    metric = EcoflowMetric(ecoflow_payload_key, self.device_name)
-                except EcoflowMetricException as error:
-                    log.error(error)
-                    continue
-                log.info(f"Created new metric from payload key {metric.ecoflow_payload_key} -> {metric.name}")
-                self.metrics_collector.append(metric)
-
-            metric.set(ecoflow_payload_value)
-
-            if ecoflow_payload_key == 'inv.acInVol' and ecoflow_payload_value == 0:
-                ac_in_current = self.get_metric_by_ecoflow_payload_key('inv.acInAmp')
-                if ac_in_current:
-                    log.debug("Set AC inverter input current to zero because of zero inverter voltage")
-                    ac_in_current.set(0)
+            if metric:
+                metric.set(ecoflow_payload_value)
 
 
-def signal_handler(signum, frame):
+def signal_handler(signum: int, frame: Optional[object]) -> None:
     log.info(f"Received signal {signum}. Exiting...")
     sys.exit(0)
 
 
-def main():
+def load_env_variable(name: str, default: Optional[str] = None) -> str:
+    value = os.getenv(name, default)
+    if value is None:
+        log.error(f"Environment variable {name} is required.")
+        sys.exit(1)
+    return value
+
+
+def main() -> None:
     # Register the signal handler for SIGTERM
     signal.signal(signal.SIGTERM, signal_handler)
 
     # Disable Process and Platform collectors
-    for coll in list(REGISTRY._collector_to_names.keys()):
-        REGISTRY.unregister(coll)
+    for collector in list(REGISTRY._collector_to_names.keys()):
+        REGISTRY.unregister(collector)
 
-    log_level = os.getenv("LOG_LEVEL", "INFO")
-
-    match log_level:
-        case "DEBUG":
-            log_level = log.DEBUG
-        case "INFO":
-            log_level = log.INFO
-        case "WARNING":
-            log_level = log.WARNING
-        case "ERROR":
-            log_level = log.ERROR
-        case _:
-            log_level = log.INFO
-
+    log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(log, log_level_str, log.INFO)
     log.basicConfig(stream=sys.stdout, level=log_level, format='%(asctime)s %(levelname)-7s %(message)s')
 
-    device_sn = os.getenv("DEVICE_SN")
-    device_name = os.getenv("DEVICE_NAME") or device_sn
-    ecoflow_username = os.getenv("ECOFLOW_USERNAME")
-    ecoflow_password = os.getenv("ECOFLOW_PASSWORD")
+    device_sn = load_env_variable("DEVICE_SN")
+    device_name = os.getenv("DEVICE_NAME", device_sn)
+    ecoflow_accesskey = load_env_variable("ECOFLOW_ACCESSKEY")
+    ecoflow_secretkey = load_env_variable("ECOFLOW_SECRETKEY")
+    ecoflow_api_endpoint = os.getenv("ECOFLOW_API_ENDPOINT", "api-e.ecoflow.com")
     exporter_port = int(os.getenv("EXPORTER_PORT", "9090"))
-    collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "10"))
-    timeout_seconds = int(os.getenv("MQTT_TIMEOUT", "60"))
+    collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "30"))
+    expiration_threshold = int(os.getenv("EXPIRATION_THRESHOLD", "300"))
 
-    if (not device_sn or not ecoflow_username or not ecoflow_password):
-        log.error("Please, provide all required environment variables: DEVICE_SN, ECOFLOW_USERNAME, ECOFLOW_PASSWORD")
-        sys.exit(1)
-
-    try:
-        auth = EcoflowAuthentication(ecoflow_username, ecoflow_password)
-    except Exception as error:
-        log.error(error)
-        sys.exit(1)
-
-    message_queue = Queue()
-
-    EcoflowMQTT(message_queue, device_sn, auth.mqtt_username, auth.mqtt_password, auth.mqtt_url, auth.mqtt_port, auth.mqtt_client_id, timeout_seconds)
-
-    metrics = Worker(message_queue, device_name, collecting_interval_seconds)
+    ecoflow_api = EcoflowApi(ecoflow_api_endpoint, ecoflow_accesskey, ecoflow_secretkey, device_sn)
+    metrics = Worker(ecoflow_api, device_name, collecting_interval_seconds, expiration_threshold)
 
     start_http_server(exporter_port)
 
     try:
         metrics.loop()
-
     except KeyboardInterrupt:
         log.info("Received KeyboardInterrupt. Exiting...")
+        metrics.stop()
         sys.exit(0)
 
 
