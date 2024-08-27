@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
-from prometheus_client import REGISTRY, Gauge, start_http_server
+from prometheus_client import REGISTRY, Gauge, Counter, start_http_server
 
 load_dotenv()
 
@@ -124,20 +124,19 @@ class EcoflowMetric:
         self.last_update_time = None
 
     def _convert_key_to_prometheus_name(self) -> str:
-        # Convert the payload key to Prometheus format by converting camel case to snake case
         key = re.sub(r'(?<!^)(?=[A-Z])', '_', self.ecoflow_payload_key.split('.')[1].replace('.', '_').replace('Statue', 'Status')).lower()
 
-        # Check if the converted key complies with the Prometheus data model
         if not re.match(r"[a-zA-Z_:][a-zA-Z0-9_:]*", key):
             raise EcoflowMetricException(f"Cannot convert payload key {self.ecoflow_payload_key} to comply with the Prometheus data model. Please, raise an issue!")
 
         return key
 
     def set(self, value):
+        original_value = value
         if self.name in DIVISORS:
             value /= DIVISORS[self.name]
 
-        log.debug(f"Set {self.name} = {value}")
+        log.debug(f"Setting {self.name} = {value} (original value: {original_value})")
 
         if self.value != value:
             self.metric.labels(device=self.device_name).set(value)
@@ -145,7 +144,7 @@ class EcoflowMetric:
             self.last_update_time = time.time()
 
     def clear(self):
-        log.debug(f"Clear {self.name}")
+        log.debug(f"Clearing {self.name}")
         self.metric.clear()
         self.last_update_time = time.time()
 
@@ -158,12 +157,18 @@ class Worker:
         self.metrics_collector: List[EcoflowMetric] = []
         self.expiration_threshold = expiration_threshold
         self.running = True
+        self.api_requests_total = Counter('ecoflow_api_requests_total', 'Total number of API requests', ['device'])
+        self.api_errors_total = Counter('ecoflow_api_errors_total', 'Total number of API errors', ['device'])
 
     def loop(self):
         while self.running:
             try:
-                self.process_payload(self.ecoflow_api.get_quota())
+                self.api_requests_total.labels(device=self.device_name).inc()
+                payload = self.ecoflow_api.get_quota()
+                log.debug(f"Received payload: {payload}")
+                self.process_payload(payload)
             except Exception as error:
+                self.api_errors_total.labels(device=self.device_name).inc()
                 log.error(f"Error processing payload: {error}")
             self.clear_expired_metrics()
             time.sleep(self.collecting_interval_seconds)
@@ -172,50 +177,48 @@ class Worker:
         self.running = False
 
     def clear_expired_metrics(self):
-        # Clear metrics that haven't been updated for more than the expiration threshold in seconds
         current_time = time.time()
         for metric in self.metrics_collector:
-            if current_time - metric.last_update_time > self.expiration_threshold:
+            if metric.last_update_time and current_time - metric.last_update_time > self.expiration_threshold:
                 metric.clear()
                 log.info(f"Cleared expired metric {metric.name}")
 
-    def create_new_metric(self, ecoflow_payload_key: str) -> EcoflowMetric:
+    def create_new_metric(self, ecoflow_payload_key: str) -> Optional[EcoflowMetric]:
         try:
             metric = EcoflowMetric(ecoflow_payload_key, self.device_name)
             log.info(f"Created new metric from payload key {metric.ecoflow_payload_key} -> {metric.name}")
             return metric
         except EcoflowMetricException as error:
-            log.error(error)
+            log.error(f"Error creating metric: {error}")
             return None
 
-    def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key: str) -> EcoflowMetric:
-        # Find the metric linked to the provided ecoflow payload key, or create a new one if not found
+    def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key: str) -> Optional[EcoflowMetric]:
         metric = next((metric for metric in self.metrics_collector if metric.ecoflow_payload_key == ecoflow_payload_key), None)
         if metric:
             log.debug(f"Found metric {metric.name} linked to {ecoflow_payload_key}")
         else:
             log.debug(f"Cannot find metric linked to {ecoflow_payload_key}. Creating new metric")
             metric = self.create_new_metric(ecoflow_payload_key)
-            self.metrics_collector.append(metric)
+            if metric:
+                self.metrics_collector.append(metric)
         return metric
 
     def process_payload(self, params: Dict[str, Any]):
         log.debug(f"Processing params: {params}")
-        for ecoflow_payload_key in params.keys():
-            # Skip non-status entries (e.g., '20_134.' for statistics)
+        for ecoflow_payload_key, ecoflow_payload_value in params.items():
             if not ecoflow_payload_key.startswith('20_1.'):
+                log.debug(f"Skipping non-status entry: {ecoflow_payload_key}")
                 continue
 
-            # Skip unsupported metric types (e.g., non-numeric values)
-            ecoflow_payload_value = params[ecoflow_payload_key]
             if not isinstance(ecoflow_payload_value, (int, float)):
                 log.info(f"Skipping unsupported metric {ecoflow_payload_key}: {ecoflow_payload_value}")
                 continue
 
-            # Create or get the metric for the current payload key
             metric = self.get_metric_by_ecoflow_payload_key(ecoflow_payload_key)
             if metric:
                 metric.set(ecoflow_payload_value)
+            else:
+                log.warning(f"Failed to process metric for payload key: {ecoflow_payload_key}")
 
 
 def signal_handler(signum: int, frame: Optional[object]) -> None:
@@ -232,10 +235,8 @@ def load_env_variable(name: str, default: Optional[str] = None) -> str:
 
 
 def main() -> None:
-    # Register the signal handler for SIGTERM
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Disable Process and Platform collectors
     for collector in list(REGISTRY._collector_to_names.keys()):
         REGISTRY.unregister(collector)
 
@@ -252,10 +253,17 @@ def main() -> None:
     collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "30"))
     expiration_threshold = int(os.getenv("EXPIRATION_THRESHOLD", "300"))
 
+    log.info(f"Starting Ecoflow exporter for device: {device_name} (SN: {device_sn})")
+    log.info(f"API endpoint: {ecoflow_api_endpoint}")
+    log.info(f"Exporter port: {exporter_port}")
+    log.info(f"Collecting interval: {collecting_interval_seconds} seconds")
+    log.info(f"Expiration threshold: {expiration_threshold} seconds")
+
     ecoflow_api = EcoflowApi(ecoflow_api_endpoint, ecoflow_accesskey, ecoflow_secretkey, device_sn)
     metrics = Worker(ecoflow_api, device_name, collecting_interval_seconds, expiration_threshold)
 
     start_http_server(exporter_port)
+    log.info(f"HTTP server started on port {exporter_port}")
 
     try:
         metrics.loop()
