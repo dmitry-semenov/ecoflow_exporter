@@ -42,13 +42,20 @@ class EcoflowAuthentication:
             'sign': sign
         }
 
+        log.debug(f"Sending authentication request to {url}")
+        log.debug(f"Request headers: {headers}")
+
         response = requests.get(url, headers=headers)
+        log.debug(f"Authentication response status code: {response.status_code}")
+        log.debug(f"Authentication response content: {response.text}")
+
         if response.status_code == 200:
             data = response.json()['data']
             self.mqtt_url = data['url']
             self.mqtt_port = int(data['port'])
             self.mqtt_username = data['certificateAccount']
             self.mqtt_password = data['certificatePassword']
+            log.debug(f"MQTT credentials obtained - URL: {self.mqtt_url}, Port: {self.mqtt_port}, Username: {self.mqtt_username}")
         else:
             raise Exception(f"Failed to get MQTT credentials: {response.text}")
 
@@ -61,14 +68,17 @@ class EcoflowMQTT:
         self.client = None
         self.stop_event = Event()
 
+        log.debug("Initializing EcoflowMQTT")
         self.auth.get_mqtt_credentials()
         self.connect()
 
     def connect(self):
         if self.client:
+            log.debug("Stopping existing MQTT client")
             self.client.loop_stop()
             self.client.disconnect()
 
+        log.debug("Creating new MQTT client")
         self.client = mqtt.Client(client_id="", clean_session=True, protocol=mqtt.MQTTv311, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
         self.client.username_pw_set(self.auth.mqtt_username, self.auth.mqtt_password)
         self.client.tls_set(certfile=None, keyfile=None, cert_reqs=ssl.CERT_REQUIRED)
@@ -78,10 +88,16 @@ class EcoflowMQTT:
         self.client.on_message = self.on_message
 
         log.info(f"Connecting to MQTT Broker {self.auth.mqtt_url}:{self.auth.mqtt_port}")
-        self.client.connect(self.auth.mqtt_url, self.auth.mqtt_port)
+        try:
+            self.client.connect(self.auth.mqtt_url, self.auth.mqtt_port)
+            log.debug("MQTT connect() call successful")
+        except Exception as e:
+            log.error(f"Failed to connect to MQTT broker: {e}")
         self.client.loop_start()
+        log.debug("MQTT client loop started")
 
     def on_connect(self, client, userdata, flags, rc, properties=None):
+        log.debug(f"MQTT on_connect callback - rc: {rc}, flags: {flags}")
         if rc == 0:
             self.connected = True
             log.info("Connected to Ecoflow MQTT Server")
@@ -92,13 +108,16 @@ class EcoflowMQTT:
             log.error(f"Failed to connect to MQTT: {mqtt.connack_string(rc)}")
 
     def on_disconnect(self, client, userdata, rc, properties=None):
+        log.debug(f"MQTT on_disconnect callback - rc: {rc}")
         if rc != 0:
             log.error(f"Unexpected MQTT disconnection: {rc}. Will auto-reconnect")
 
     def on_message(self, client, userdata, message):
+        log.debug(f"Received MQTT message on topic: {message.topic}")
         self.message_queue.put(message.payload.decode("utf-8"))
 
     def stop(self):
+        log.debug("Stopping EcoflowMQTT")
         self.stop_event.set()
         if self.client:
             self.client.loop_stop()
@@ -220,6 +239,8 @@ def main():
     if not all([device_sn, access_key, secret_key]):
         log.error("Please provide all required environment variables: DEVICE_SN, ECOFLOW_ACCESS_KEY, ECOFLOW_SECRET_KEY")
         sys.exit(1)
+
+    log.debug(f"Initializing with Device SN: {device_sn}, Device Name: {device_name}, API Host: {api_host}")
 
     auth = EcoflowAuthentication(access_key, secret_key, api_host)
     message_queue = Queue()
