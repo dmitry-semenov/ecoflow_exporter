@@ -48,7 +48,7 @@ services:
       - 3000:3000
 
   ecoflow_exporter:
-    image: ghcr.io/berezhinskiy/ecoflow_exporter
+    image: ghcr.io/dmitry-semenov/ecoflow_exporter:latest
     ...
     ports:
       - 9091:9091
@@ -74,10 +74,11 @@ To run all the services together, do the following:
 ```bash
 # Serial number of your device shown in the mobile application
 DEVICE_SN="DEVICE_SN"
-# Email entered in the mobile application
-ECOFLOW_USERNAME="ECOFLOW_USERNAME"
-# Password entereed in the mobile application
-ECOFLOW_PASSWORD="ECOFLOW_PASSWORD"
+
+# the keys received through the developer portal https://developer-eu.ecoflow.com/us/security
+ECOFLOW_ACCESS_KEY="access key"
+ECOFLOW_SECRET_KEY="secret key"
+
 # Username for Grafana Web interface
 GRAFANA_USERNAME="admin"
 # Password for Grafana Web interface
