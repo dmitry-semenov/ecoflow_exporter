@@ -17,12 +17,62 @@ import requests
 import paho.mqtt.client as mqtt
 from prometheus_client import start_http_server, REGISTRY, Gauge, Counter
 
+DIVISORS = {
+    'bmsMaster.amp': 1000,  # Convert mA to A
+    'bmsMaster.designCap': 1000,  # Convert mAh to Ah
+    'bmsMaster.fullCap': 1000,  # Convert mAh to Ah
+    'bmsMaster.maxCellVol': 1000,  # Convert mV to V
+    'bmsMaster.minCellVol': 1000,  # Convert mV to V
+    'bmsMaster.remainCap': 1000,  # Convert mAh to Ah
+    'bmsMaster.tagChgAmp': 1000,  # Convert mA to A
+    'bmsMaster.vol': 1000,  # Convert mV to V
+    'bmsMaster.inputWatts': 1000,  # Convert W to kW
+    'bmsMaster.outputWatts': 1000,  # Convert W to kW
+    'ems.chgAmp': 1000,  # Convert mA to A
+    'ems.chgVol': 1000,  # Convert mV to V
+    'ems.paraVolMax': 1000,  # Convert mV to V
+    'ems.paraVolMin': 1000,  # Convert mV to V
+    'inv.acInAmp': 1000,  # Convert mA to A
+    'inv.acInVol': 1000,  # Convert mV to V
+    'inv.cfgAcOutVoltage': 1000,  # Convert mV to V
+    'inv.dcInAmp': 1000,  # Convert mA to A
+    'inv.dcInVol': 1000,  # Convert mV to V
+    'inv.invOutAmp': 1000,  # Convert mA to A
+    'inv.invOutVol': 1000,  # Convert mV to V
+    'mppt.carOutAmp': 1000,  # Convert mA to A
+    'mppt.carOutVol': 1000,  # Convert mV to V
+    'mppt.cfgDcChgCurrent': 1000,  # Convert mA to A
+    'mppt.dcdc12vAmp': 1000,  # Convert mA to A
+    'mppt.dcdc12vVol': 1000,  # Convert mV to V
+    'mppt.inAmp': 1000,  # Convert mA to A
+    'mppt.inVol': 1000,  # Convert mV to V
+    'mppt.outAmp': 1000,  # Convert mA to A
+    'mppt.outVol': 1000,  # Convert mV to V
+    'pd.chgPowerAc': 1000,  # Convert W to kW
+    'pd.dsgPowerAc': 1000,  # Convert W to kW
+    'pd.chgPowerDc': 1000,  # Convert Wh to kWh
+    'pd.chgSunPower': 1000,  # Convert Wh to kWh
+    'pd.dsgPowerDc': 1000,  # Convert Wh to kWh
+}
+
+# Time-related conversions
+TIME_CONVERSIONS = {
+    'pd.remainTime': 60,  # Convert minutes to seconds
+    'ems.chgRemainTime': 60,  # Convert minutes to seconds
+    'ems.dsgRemainTime': 60,  # Convert minutes to seconds
+    'pd.invUsedTime': 1,  # Already in seconds
+    'pd.usbUsedTime': 1,  # Already in seconds
+    'pd.usbqcUsedTime': 1,  # Already in seconds
+    'pd.typccUsedTime': 1,  # Already in seconds
+    'pd.carUsedTime': 1,  # Already in seconds
+    'pd.dcInUsedTime': 1,  # Already in seconds
+    'pd.mpptUsedTime': 1,  # Already in seconds
+}
 
 class RepeatTimer(Timer):
     def run(self):
         while not self.finished.wait(self.interval):
             self.function(*self.args, **self.kwargs)
-
 
 class EcoflowMetricException(Exception):
     pass
@@ -181,13 +231,73 @@ class EcoflowMetric:
         self.device_name = device_name
         self.name = f"ecoflow_{self.convert_ecoflow_key_to_prometheus_name()}"
         self.is_version_metric = self.name.endswith('_ver') or self.name.endswith('_version')
+        self.is_time_metric = self.ecoflow_payload_key in TIME_CONVERSIONS
+        self.value = None
+        self.last_update_time = None
+        
+        unit = self.get_unit()
+        description = f"value from MQTT object key {ecoflow_payload_key}"
+        if unit:
+            description += f" (in {unit})"
         
         if self.is_version_metric:
-            self.metric = Gauge(self.name, f"value from MQTT object key {ecoflow_payload_key}", 
-                                labelnames=["device", "formatted"])
+            self.metric = Gauge(self.name, description, labelnames=["device", "formatted"])
         else:
-            self.metric = Gauge(self.name, f"value from MQTT object key {ecoflow_payload_key}", 
-                                labelnames=["device"])
+            self.metric = Gauge(self.name, description, labelnames=["device"])
+
+
+    def set(self, value):
+        original_value = value
+
+        if self.ecoflow_payload_key in DIVISORS:
+            value /= DIVISORS[self.ecoflow_payload_key]
+        
+        if self.is_time_metric:
+            if self.ecoflow_payload_key == 'ems.chgRemainTime' and value > 1e6:
+                log.debug(f"Charging remaining time is very large: {value}. Setting to infinity.")
+                value = float('inf')
+            else:
+                value *= TIME_CONVERSIONS[self.ecoflow_payload_key]
+
+        if self.is_version_metric:
+            major = int(value / 1000000)
+            minor = int((value % 1000000) / 10000)
+            patch = value % 10000
+            formatted_value = f"{major}.{minor:02d}.{patch:05d}"
+            log.debug(f"Set {self.name} = {formatted_value} (raw: {original_value})")
+            self.metric.labels(device=self.device_name, formatted=formatted_value).set(value)
+        else:
+            log.debug(f"Set {self.name} = {value} (original: {original_value})")
+            self.metric.labels(device=self.device_name).set(value)
+
+        self.value = value
+        self.last_update_time = time.time()
+
+
+    def get_unit(self):
+        if self.name.endswith('_vol'):
+            return 'volts'
+        elif self.name.endswith('_amp'):
+            return 'amperes'
+        elif 'watts' in self.name.lower():
+            if self.ecoflow_payload_key in DIVISORS and DIVISORS[self.ecoflow_payload_key] == 1000:
+                return 'kilowatts'
+            return 'watts'
+        elif 'temp' in self.name:
+            return 'celsius'
+        elif 'cap' in self.name:
+            return 'ampere_hours'
+        elif self.is_time_metric:
+            return 'seconds'
+        elif 'freq' in self.name:
+            return 'hertz'
+        elif self.name.endswith('_power'):
+            if self.ecoflow_payload_key in DIVISORS and DIVISORS[self.ecoflow_payload_key] == 1000:
+                return 'kilowatt_hours'
+            return 'watt_hours'
+        else:
+            return None
+
 
     def convert_ecoflow_key_to_prometheus_name(self):
         # bms_bmsStatus.maxCellTemp -> bms_bms_status_max_cell_temp
@@ -204,39 +314,18 @@ class EcoflowMetric:
             raise EcoflowMetricException(f"Cannot convert payload key {self.ecoflow_payload_key} to comply with the Prometheus data model. Please, raise an issue!")
         return new
 
-    def set(self, value):
-        original_value = value  # Store the original value for logging
-
-        # Convert units where necessary
-        if self.name.endswith('_vol'):
-            value = value / 1000  # Convert millivolts to volts
-        elif self.name.endswith('_amp'):
-            value = value / 1000  # Convert milliamps to amps
-        elif '_used_time' in self.name or '_remain_time' in self.name:
-            value = value / 1000  # Convert milliseconds to seconds
-        
-        # Special handling for version numbers
-        if self.is_version_metric:
-            major = int(value / 1000000)
-            minor = int((value % 1000000) / 10000)
-            patch = value % 10000
-            formatted_value = f"{major}.{minor:02d}.{patch:05d}"
-            log.debug(f"Set {self.name} = {formatted_value} (raw: {original_value})")
-            self.metric.labels(device=self.device_name, formatted=formatted_value).set(value)
-        else:
-            log.debug(f"Set {self.name} = {value} (original: {original_value})")
-            self.metric.labels(device=self.device_name).set(value)
-
     def clear(self):
         log.debug(f"Clear {self.name}")
-        self.metric.clear()
-
+        if not self.is_time_metric or not self.ecoflow_payload_key.endswith('UsedTime'):
+            self.metric.clear()
+        self.last_update_time = time.time()
 
 class Worker:
-    def __init__(self, message_queue, device_name, collecting_interval_seconds=10):
+    def __init__(self, message_queue, device_name, collecting_interval_seconds=10, expiration_threshold=300):
         self.message_queue = message_queue
         self.device_name = device_name
         self.collecting_interval_seconds = collecting_interval_seconds
+        self.expiration_threshold = expiration_threshold
         self.metrics_collector = []
         self.online = Gauge("ecoflow_online", "1 if device is online", labelnames=["device"])
         self.mqtt_messages_receive_total = Counter("ecoflow_mqtt_messages_receive_total", "total MQTT messages", labelnames=["device"])
@@ -258,7 +347,7 @@ class Worker:
 
             while not self.message_queue.empty():
                 payload = self.message_queue.get()
-                log.debug(f"Recived payload: {payload}")
+                log.debug(f"Received payload: {payload}")
                 if payload is None:
                     continue
 
@@ -272,7 +361,15 @@ class Worker:
                     continue
                 self.process_payload(params)
 
+            self.clear_expired_metrics()
             time.sleep(self.collecting_interval_seconds)
+
+    def clear_expired_metrics(self):
+        current_time = time.time()
+        for metric in self.metrics_collector:
+            if current_time - metric.last_update_time > self.expiration_threshold:
+                metric.clear()
+                log.info(f"Cleared expired metric {metric.name}")
 
     def get_metric_by_ecoflow_payload_key(self, ecoflow_payload_key):
         for metric in self.metrics_collector:
@@ -312,7 +409,6 @@ class Worker:
 def signal_handler(signum, frame):
     log.info(f"Received signal {signum}. Exiting...")
     sys.exit(0)
-
 
 def main():
     # Register the signal handler for SIGTERM
