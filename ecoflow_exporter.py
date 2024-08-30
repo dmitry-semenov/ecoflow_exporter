@@ -180,7 +180,14 @@ class EcoflowMetric:
         self.ecoflow_payload_key = ecoflow_payload_key
         self.device_name = device_name
         self.name = f"ecoflow_{self.convert_ecoflow_key_to_prometheus_name()}"
-        self.metric = Gauge(self.name, f"value from MQTT object key {ecoflow_payload_key}", labelnames=["device"])
+        self.is_version_metric = self.name.endswith('_ver') or self.name.endswith('_version')
+        
+        if self.is_version_metric:
+            self.metric = Gauge(self.name, f"value from MQTT object key {ecoflow_payload_key}", 
+                                labelnames=["device", "formatted"])
+        else:
+            self.metric = Gauge(self.name, f"value from MQTT object key {ecoflow_payload_key}", 
+                                labelnames=["device"])
 
     def convert_ecoflow_key_to_prometheus_name(self):
         # bms_bmsStatus.maxCellTemp -> bms_bms_status_max_cell_temp
@@ -198,11 +205,27 @@ class EcoflowMetric:
         return new
 
     def set(self, value):
-        # According to best practices for naming metrics and labels, the voltage should be in volts and the current in amperes
-        # WARNING! This will ruin all Prometheus historical data and backward compatibility of Grafana dashboard
-        # value = value / 1000 if value.endswith("_vol") or value.endswith("_amp") else value
-        log.debug(f"Set {self.name} = {value}")
-        self.metric.labels(device=self.device_name).set(value)
+        original_value = value  # Store the original value for logging
+
+        # Convert units where necessary
+        if self.name.endswith('_vol'):
+            value = value / 1000  # Convert millivolts to volts
+        elif self.name.endswith('_amp'):
+            value = value / 1000  # Convert milliamps to amps
+        elif '_used_time' in self.name or '_remain_time' in self.name:
+            value = value / 1000  # Convert milliseconds to seconds
+        
+        # Special handling for version numbers
+        if self.is_version_metric:
+            major = int(value / 1000000)
+            minor = int((value % 1000000) / 10000)
+            patch = value % 10000
+            formatted_value = f"{major}.{minor:02d}.{patch:05d}"
+            log.debug(f"Set {self.name} = {formatted_value} (raw: {original_value})")
+            self.metric.labels(device=self.device_name, formatted=formatted_value).set(value)
+        else:
+            log.debug(f"Set {self.name} = {value} (original: {original_value})")
+            self.metric.labels(device=self.device_name).set(value)
 
     def clear(self):
         log.debug(f"Clear {self.name}")
