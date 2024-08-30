@@ -39,6 +39,8 @@ Required:
 
 Optional:
 
+`CLIENT_ID` - If provided, we'll use a static client ID for the MQTT connection. Note that only 10 unique client IDs are allowed per day. If you frequently encounter "Not authorized" errors, try recreating your access key and secret and set a static client ID.
+
 `DEVICE_NAME` - If given, this name will be exported as `device` label instead of the device serial number
 
 `EXPORTER_PORT` - (default: `9090`)

@@ -29,8 +29,7 @@ class EcoflowMetricException(Exception):
 
 
 class EcoflowAuthentication:
-    def __init__(self, device_sn, ecoflow_access_key, ecoflow_secret_key, ecoflow_api_host):
-        self.device_sn = device_sn
+    def __init__(self, client_id, ecoflow_access_key, ecoflow_secret_key, ecoflow_api_host):
         self.ecoflow_access_key = ecoflow_access_key
         self.ecoflow_secret_key = ecoflow_secret_key
         self.ecoflow_api_host = ecoflow_api_host
@@ -38,7 +37,7 @@ class EcoflowAuthentication:
         self.mqtt_port = 8883
         self.mqtt_username = None
         self.mqtt_password = None
-        self.mqtt_client_id = None
+        self.mqtt_client_id = client_id
         self.authorize()
 
     def authorize(self):
@@ -63,13 +62,7 @@ class EcoflowAuthentication:
             self.mqtt_port = int(data['port'])
             self.mqtt_username = data['certificateAccount']
             self.mqtt_password = data['certificatePassword']
-            # client_id limits for MQTT connections
-            # If you are using MQTT to connect to the API be aware that only 10 unique client IDs are allowed per day. 
-            # As such, it is suggested that you choose a static client_id for your application or integration to use consistently. 
-            # If your code generates a unique client_id (as mine did) for each connection,
-            # you can exceed this limit very quickly when testing or debugging code.
-            self.mqtt_client_id = f"ecoflow_exporter_{self.device_sn}_{datetime.now().strftime('%Y%m%d')}"
-            log.debug(f"MQTT credentials obtained - URL: {self.mqtt_url}:{self.mqtt_port}\nUsername: {self.mqtt_username}\nPassword: {self.mqtt_password}")
+            log.debug(f"MQTT credentials obtained - URL: {self.mqtt_url}:{self.mqtt_port}\nClientID: {self.mqtt_client_id}\nUsername: {self.mqtt_username}\nPassword: {self.mqtt_password}")
         else:
             raise Exception(f"Failed to get MQTT credentials: {response.text}")
 
@@ -334,6 +327,11 @@ def main():
 
     device_sn = os.getenv("DEVICE_SN")
     device_name = os.getenv("DEVICE_NAME") or device_sn
+    # If you are using MQTT to connect to the API be aware that only 10 unique client IDs are allowed per day. 
+    # As such, it is suggested that you choose a static client_id for your application or integration to use consistently. 
+    # If your code generates a unique client_id (as mine did) for each connection,
+    # you can exceed this limit very quickly when testing or debugging code.
+    client_id = os.getenv("CLIENT_ID") or f"ecoflow_exporter_{device_sn}_{datetime.now().strftime('%Y%m%d')}"
     access_key = os.getenv("ECOFLOW_ACCESS_KEY")
     secret_key = os.getenv("ECOFLOW_SECRET_KEY")
     ecoflow_api_host = os.getenv("ECOFLOW_API_HOST", "api.ecoflow.com")
@@ -346,7 +344,7 @@ def main():
         sys.exit(1)
 
     try:
-        auth = EcoflowAuthentication(device_sn, access_key, secret_key, ecoflow_api_host)
+        auth = EcoflowAuthentication(client_id, access_key, secret_key, ecoflow_api_host)
     except Exception as error:
         log.error(error)
         sys.exit(1)
