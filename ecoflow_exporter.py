@@ -200,19 +200,9 @@ class EcoflowMetric:
     def set(self, value):
         # According to best practices for naming metrics and labels, the voltage should be in volts and the current in amperes
         # WARNING! This will ruin all Prometheus historical data and backward compatibility of Grafana dashboard
-        if isinstance(value, str):
-            value = float(value)  # Convert string to float
-            if self.name.endswith("_vol") or self.name.endswith("_amp"):
-                value = value / 1000
-        elif isinstance(value, (int, float)):
-            if self.name.endswith("_vol") or self.name.endswith("_amp"):
-                value = value / 1000
-        else:
-            log.warning(f"Unexpected value type for {self.name}: {type(value)}. Using as-is.")
-
+        # value = value / 1000 if value.endswith("_vol") or value.endswith("_amp") else value
         log.debug(f"Set {self.name} = {value}")
         self.metric.labels(device=self.device_name).set(value)
-
 
     def clear(self):
         log.debug(f"Clear {self.name}")
