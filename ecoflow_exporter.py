@@ -6,6 +6,7 @@ import ssl
 import time
 import json
 import re
+import random
 import base64
 import hashlib
 import hmac
@@ -119,7 +120,7 @@ class EcoflowAuthentication:
     def _signed_headers(self, params=""):
         """Build signed headers for EcoFlow IoT Open API requests."""
         timestamp = str(int(time.time() * 1000))
-        nonce = base64.b64encode(hashlib.sha256(timestamp.encode()).digest()).decode()[:-1]
+        nonce = str(random.randint(100000, 999999))
         sign_parts = []
         if params:
             sign_parts.append(params)
