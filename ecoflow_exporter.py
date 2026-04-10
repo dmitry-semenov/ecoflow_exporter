@@ -116,6 +116,43 @@ class EcoflowAuthentication:
         else:
             raise Exception(f"Failed to get MQTT credentials: {response.text}")
 
+    def _signed_headers(self, params=""):
+        """Build signed headers for EcoFlow IoT Open API requests."""
+        timestamp = str(int(time.time() * 1000))
+        nonce = base64.b64encode(hashlib.sha256(timestamp.encode()).digest()).decode()[:-1]
+        sign_parts = []
+        if params:
+            sign_parts.append(params)
+        sign_parts.append(f'accessKey={self.ecoflow_access_key}')
+        sign_parts.append(f'nonce={nonce}')
+        sign_parts.append(f'timestamp={timestamp}')
+        to_sign = '&'.join(sign_parts)
+        sign = hmac.new(self.ecoflow_secret_key.encode(), to_sign.encode(), hashlib.sha256).hexdigest()
+        return {
+            'accessKey': self.ecoflow_access_key,
+            'timestamp': timestamp,
+            'nonce': nonce,
+            'sign': sign,
+        }
+
+    def get_all_quotas(self, device_sn):
+        """Fetch a full snapshot of all device parameters via REST API."""
+        url = f"https://{self.ecoflow_api_host}/iot-open/sign/device/quota/all"
+        headers = self._signed_headers(f'sn={device_sn}')
+        try:
+            response = requests.get(url, headers=headers, params={'sn': device_sn}, timeout=15)
+            if response.status_code != 200:
+                log.warning(f"quota/all returned HTTP {response.status_code}: {response.text[:200]}")
+                return None
+            data = response.json()
+            if data.get('message', '').lower() != 'success':
+                log.warning(f"quota/all returned: {data.get('message')}")
+                return None
+            return data.get('data', {})
+        except Exception as e:
+            log.warning(f"quota/all request failed: {e}")
+            return None
+
     def get_json_response(self, request):
         if request.status_code != 200:
             raise Exception(f"Got HTTP status code {request.status_code}: {request.text}")
@@ -321,11 +358,16 @@ class EcoflowMetric:
         self.last_update_time = time.time()
 
 class Worker:
-    def __init__(self, message_queue, device_name, collecting_interval_seconds=10, expiration_threshold=300):
+    def __init__(self, message_queue, device_name, collecting_interval_seconds=10, expiration_threshold=300,
+                 auth=None, device_sn=None, quota_poll_interval=60):
         self.message_queue = message_queue
         self.device_name = device_name
         self.collecting_interval_seconds = collecting_interval_seconds
         self.expiration_threshold = expiration_threshold
+        self.auth = auth
+        self.device_sn = device_sn
+        self.quota_poll_interval = quota_poll_interval
+        self.last_quota_poll = 0
         self.metrics_collector = []
         self.online = Gauge("ecoflow_online", "1 if device is online", labelnames=["device"])
         self.mqtt_messages_receive_total = Counter("ecoflow_mqtt_messages_receive_total", "total MQTT messages", labelnames=["device"])
@@ -361,8 +403,38 @@ class Worker:
                     continue
                 self.process_payload(params)
 
+            # Periodically fetch a full parameter snapshot via REST API.
+            # MQTT /quota only pushes deltas — idle devices may report very
+            # few metrics. quota/all returns everything in one shot.
+            if self.auth and self.device_sn and (time.time() - self.last_quota_poll > self.quota_poll_interval):
+                self.poll_all_quotas()
+
             self.clear_expired_metrics()
             time.sleep(self.collecting_interval_seconds)
+
+    def poll_all_quotas(self):
+        self.last_quota_poll = time.time()
+        data = self.auth.get_all_quotas(self.device_sn)
+        if not data:
+            return
+        count = 0
+        for section_key, section_val in data.items():
+            if isinstance(section_val, dict):
+                for param_key, param_val in section_val.items():
+                    if isinstance(param_val, (int, float)):
+                        full_key = f"{section_key}.{param_key}"
+                        metric = self.get_metric_by_ecoflow_payload_key(full_key)
+                        if not metric:
+                            try:
+                                metric = EcoflowMetric(full_key, self.device_name)
+                            except EcoflowMetricException as error:
+                                log.error(error)
+                                continue
+                            log.info(f"Created new metric from quota/all key {full_key} -> {metric.name}")
+                            self.metrics_collector.append(metric)
+                        metric.set(param_val)
+                        count += 1
+        log.info(f"Polled {count} params from quota/all REST API")
 
     def clear_expired_metrics(self):
         current_time = time.time()
@@ -447,6 +519,7 @@ def main():
     exporter_port = int(os.getenv("EXPORTER_PORT", "9090"))
     collecting_interval_seconds = int(os.getenv("COLLECTING_INTERVAL", "10"))
     timeout_seconds = int(os.getenv("MQTT_TIMEOUT", "60"))
+    quota_poll_interval = int(os.getenv("QUOTA_POLL_INTERVAL", "0"))
 
     if (not device_sn or not access_key or not secret_key):
         log.error("Please, provide all required environment variables: DEVICE_SN, ECOFLOW_ACCESS_KEY, ECOFLOW_SECRET_KEY")
@@ -462,7 +535,10 @@ def main():
 
     EcoflowMQTT(message_queue, device_sn, auth.mqtt_username, auth.mqtt_password, auth.mqtt_url, auth.mqtt_port, auth.mqtt_client_id, timeout_seconds)
 
-    metrics = Worker(message_queue, device_name, collecting_interval_seconds)
+    metrics = Worker(message_queue, device_name, collecting_interval_seconds,
+                     auth=auth if quota_poll_interval > 0 else None,
+                     device_sn=device_sn if quota_poll_interval > 0 else None,
+                     quota_poll_interval=quota_poll_interval)
 
     start_http_server(exporter_port)
 
