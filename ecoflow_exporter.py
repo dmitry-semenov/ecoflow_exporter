@@ -418,24 +418,8 @@ class Worker:
         data = self.auth.get_all_quotas(self.device_sn)
         if not data:
             return
-        count = 0
-        for section_key, section_val in data.items():
-            if isinstance(section_val, dict):
-                for param_key, param_val in section_val.items():
-                    if isinstance(param_val, (int, float)):
-                        full_key = f"{section_key}.{param_key}"
-                        metric = self.get_metric_by_ecoflow_payload_key(full_key)
-                        if not metric:
-                            try:
-                                metric = EcoflowMetric(full_key, self.device_name)
-                            except EcoflowMetricException as error:
-                                log.error(error)
-                                continue
-                            log.info(f"Created new metric from quota/all key {full_key} -> {metric.name}")
-                            self.metrics_collector.append(metric)
-                        metric.set(param_val)
-                        count += 1
-        log.info(f"Polled {count} params from quota/all REST API")
+        self.process_payload(data)
+        log.info(f"Polled {len(data)} params from quota/all REST API")
 
     def clear_expired_metrics(self):
         current_time = time.time()
